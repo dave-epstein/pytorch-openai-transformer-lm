@@ -3,7 +3,7 @@ import json
 import math
 import re
 import collections
-
+import ipdb
 import numpy as np
 import torch
 import torch.nn as nn
@@ -66,12 +66,13 @@ class Conv1D(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, nx, n_ctx, cfg, scale=False):
+    def __init__(self, nx, n_ctx, cfg, scale=False, query_selector=None):
         super(Attention, self).__init__()
         n_state = nx  # in Attention: n_state=768 (nx=n_embd)
         # [switch nx => n_state from Block to Attention to keep identical to TF implem]
         assert n_state % cfg.n_head == 0
-        self.register_buffer('b', torch.tril(torch.ones(n_ctx, n_ctx)).view(1, 1, n_ctx, n_ctx))
+        # self.register_buffer('b', torch.tril(
+        #    torch.ones(n_ctx, n_ctx)).view(1, 1, n_ctx, n_ctx))
         self.n_head = cfg.n_head
         self.split_size = n_state
         self.scale = scale
@@ -79,15 +80,18 @@ class Attention(nn.Module):
         self.c_proj = Conv1D(n_state, 1, nx)
         self.attn_dropout = nn.Dropout(cfg.attn_pdrop)
         self.resid_dropout = nn.Dropout(cfg.resid_pdrop)
+        self.query_selector = query_selector
 
-    def _attn(self, q, k, v):
+    def _attn(self, q, k, v, mask=None):
         w = torch.matmul(q, k)
         if self.scale:
             w = w / math.sqrt(v.size(-1))
         # w = w * self.b + -1e9 * (1 - self.b)  # TF implem method: mask_attn_weights
         # XD: self.b may be larger than w, so we need to crop it
-        b = self.b[:, :, :w.size(-2), :w.size(-1)]
-        w = w * b + -1e9 * (1 - b)
+
+        if mask is not None:
+            mask = mask.unsqueeze(1).unsqueeze(2)
+            w = w * mask + -10000 * (1 - mask)
 
         w = nn.Softmax(dim=-1)(w)
         w = self.attn_dropout(w)
@@ -106,13 +110,15 @@ class Attention(nn.Module):
         else:
             return x.permute(0, 2, 1, 3)
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         x = self.c_attn(x)
         query, key, value = x.split(self.split_size, dim=2)
         query = self.split_heads(query)
+        if self.query_selector is not None:
+            query = self.query_selector(query)
         key = self.split_heads(key, k=True)
         value = self.split_heads(value)
-        a = self._attn(query, key, value)
+        a = self._attn(query, key, value, mask)
         a = self.merge_heads(a)
         a = self.c_proj(a)
         a = self.resid_dropout(a)
@@ -143,8 +149,8 @@ class Block(nn.Module):
         self.mlp = MLP(4 * nx, cfg)
         self.ln_2 = LayerNorm(nx)
 
-    def forward(self, x):
-        a = self.attn(x)
+    def forward(self, x, mask=None):
+        a = self.attn(x, mask)
         n = self.ln_1(x + a)
         m = self.mlp(n)
         h = self.ln_2(n + m)
@@ -160,7 +166,8 @@ class TransformerModel(nn.Module):
         self.embed = nn.Embedding(vocab, cfg.n_embd)
         self.drop = nn.Dropout(cfg.embd_pdrop)
         block = Block(n_ctx, cfg, scale=True)
-        self.h = nn.ModuleList([copy.deepcopy(block) for _ in range(cfg.n_layer)])
+        self.h = nn.ModuleList([copy.deepcopy(block)
+                                for _ in range(cfg.n_layer)])
 
         nn.init.normal_(self.embed.weight, std=0.02)
 
@@ -182,7 +189,7 @@ class LMHead(nn.Module):
         self.n_embd = cfg.n_embd
         embed_shape = model.embed.weight.shape
         self.decoder = nn.Linear(embed_shape[1], embed_shape[0], bias=False)
-        self.decoder.weight = model.embed.weight # Tied weights
+        self.decoder.weight = model.embed.weight  # Tied weights
         self.trunc_and_reshape = trunc_and_reshape  # XD
 
     def forward(self, h):
@@ -200,10 +207,11 @@ class MultipleChoiceHead(nn.Module):
         super(MultipleChoiceHead, self).__init__()
         self.n_embd = cfg.n_embd
         self.clf_token = clf_token
-        self.dropout = nn.Dropout2d(cfg.clf_pdrop)  # To reproduce the noise_shape parameter of TF implementation
+        # To reproduce the noise_shape parameter of TF implementation
+        self.dropout = nn.Dropout2d(cfg.clf_pdrop)
         self.linear = nn.Linear(cfg.n_embd, 1)
 
-        nn.init.normal_(self.linear.weight, std = 0.02)
+        nn.init.normal_(self.linear.weight, std=0.02)
         nn.init.normal_(self.linear.bias, 0)
 
     def forward(self, h, x):
@@ -227,6 +235,7 @@ class ClfHead(nn.Module):
     """Classification Head for the transformer
 
     TODO: test this class."""
+
     def __init__(self, clf_token, cfg, n_class):
         super(ClfHead, self).__init__()
         self.n_embd = cfg.n_embd
@@ -234,7 +243,7 @@ class ClfHead(nn.Module):
         self.dropout = nn.Dropout(cfg.clf_pdrop)
         self.linear = nn.Linear(cfg.n_embd, n_class)
 
-        nn.init.normal_(self.linear.weight, std = 0.02)
+        nn.init.normal_(self.linear.weight, std=0.02)
         nn.init.normal_(self.linear.bias, 0)
 
     def forward(self, h, x):
@@ -246,10 +255,12 @@ class ClfHead(nn.Module):
 
         return clf_logits
 
+
 class SimilarityHead(nn.Module):
     """ Similarity Head for the transformer
 
         TODO: test this class."""
+
     def __init__(self, clf_token, cfg):
         super(SimilarityHead, self).__init__()
         self.n_embd = cfg.n_embd
@@ -257,7 +268,7 @@ class SimilarityHead(nn.Module):
         self.dropout = nn.Dropout(cfg.clf_pdrop)
         self.linear = nn.Linear(cfg.n_embd, 1)
 
-        nn.init.normal_(self.linear.weight, std = 0.02)
+        nn.init.normal_(self.linear.weight, std=0.02)
         nn.init.normal_(self.linear.bias, 0)
 
     def forward(self, h, x):
@@ -265,7 +276,7 @@ class SimilarityHead(nn.Module):
         flat = x[..., 0].contiguous().view(-1)
         sim_h = sim_h[flat == self.clf_token, :]
         sim_h = self.dropout(sim_h)
-        sim_h = sim_h.sum(dim = 1)
+        sim_h = sim_h.sum(dim=1)
         sim_logits = self.linear(sim_h)
 
         return sim_logits
@@ -274,6 +285,7 @@ class SimilarityHead(nn.Module):
 # XD
 class LMModel(nn.Module):
     """ Transformer with language model head only """
+
     def __init__(self, cfg, vocab=40990, n_ctx=512, return_probs=False):
         super(LMModel, self).__init__()
         self.transformer = TransformerModel(cfg, vocab=vocab, n_ctx=n_ctx)
@@ -283,7 +295,6 @@ class LMModel(nn.Module):
             pos_emb_mask = torch.zeros(1, 1, vocab)
             pos_emb_mask[:, :, -n_ctx:] = -1e12
             self.register_buffer('pos_emb_mask', pos_emb_mask)
-
 
     def forward(self, x):
         h = self.transformer(x)
@@ -295,6 +306,7 @@ class LMModel(nn.Module):
 
 class DoubleHeadModel(nn.Module):
     """ Transformer with language model and task specific heads """
+
     def __init__(self, cfg, clf_token, task_head_type, vocab=40990, n_ctx=512):
         super(DoubleHeadModel, self).__init__()
         self.transformer = TransformerModel(cfg, vocab=vocab, n_ctx=n_ctx)
@@ -312,7 +324,7 @@ class DoubleHeadModel(nn.Module):
                                  "'similarity', 'inference' or ('classification', n_class) "
                                  f"got {task_head_type}.")
         elif isinstance(task_head_type, collections.abc.Sequence) and len(task_head_type) == 2 and \
-             task_head_type[0] == 'classification':
+                task_head_type[0] == 'classification':
             n_class = task_head_type[1]
             self.task_head = ClfHead(clf_token, cfg, n_class)
         else:
@@ -335,9 +347,11 @@ def load_openai_pretrained_model(model, n_ctx=-1, n_special=-1, n_transfer=12, n
     names = json.load(open(path_names + 'parameters_names.json'))
     shapes = json.load(open(path + 'params_shapes.json'))
     offsets = np.cumsum([np.prod(shape) for shape in shapes])
-    init_params = [np.load(path + 'params_{}.npy'.format(n)) for n in range(10)]
+    init_params = [np.load(path + 'params_{}.npy'.format(n))
+                   for n in range(10)]
     init_params = np.split(np.concatenate(init_params, 0), offsets)[:-1]
-    init_params = [param.reshape(shape) for param, shape in zip(init_params, shapes)]
+    init_params = [param.reshape(shape)
+                   for param, shape in zip(init_params, shapes)]
     if n_ctx > 0:
         init_params[0] = init_params[0][:n_ctx]
     if n_special > 0:
@@ -398,8 +412,8 @@ class dotdict(dict):
 
 DEFAULT_CONFIG = dotdict({
     'n_embd': 768,
-    'n_head': 12,
-    'n_layer': 12,
+    'n_head': 8,
+    'n_layer': 4,
     'embd_pdrop': 0.1,
     'attn_pdrop': 0.1,
     'resid_pdrop': 0.1,
