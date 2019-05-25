@@ -66,7 +66,7 @@ class Conv1D(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, nx, n_ctx, cfg, scale=False, query_selector=None):
+    def __init__(self, nx, n_ctx, cfg, scale=False, query_selector=None, ret_wts=False):
         super(Attention, self).__init__()
         n_state = nx  # in Attention: n_state=768 (nx=n_embd)
         # [switch nx => n_state from Block to Attention to keep identical to TF implem]
@@ -81,6 +81,7 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(cfg.attn_pdrop)
         self.resid_dropout = nn.Dropout(cfg.resid_pdrop)
         self.query_selector = query_selector
+        self.ret_wts = ret_wts
 
     def _attn(self, q, k, v, mask=None):
         w = torch.matmul(q, k)
@@ -93,9 +94,12 @@ class Attention(nn.Module):
             mask = mask.unsqueeze(1).unsqueeze(2)
             w = w * mask + -10000 * (1 - mask)
 
-        w = nn.Softmax(dim=-1)(w)
-        w = self.attn_dropout(w)
-        return torch.matmul(w, v)
+        w_ = nn.Softmax(dim=-1)(w)
+        w = self.attn_dropout(w_)
+        if self.ret_wts:
+            return torch.matmul(w, v), w_
+        else:
+            return torch.matmul(w, v)
 
     def merge_heads(self, x):
         x = x.permute(0, 2, 1, 3).contiguous()
@@ -118,11 +122,17 @@ class Attention(nn.Module):
             query = self.query_selector(query)
         key = self.split_heads(key, k=True)
         value = self.split_heads(value)
-        a = self._attn(query, key, value, mask)
+        if self.ret_wts:
+            a, wts = self._attn(query, key, value, mask)
+        else:
+            a = self._attn(query, key, value, mask)
         a = self.merge_heads(a)
         a = self.c_proj(a)
         a = self.resid_dropout(a)
-        return a
+        if self.ret_wts:
+            return a, wts
+        else:
+            return a
 
 
 class MLP(nn.Module):
@@ -141,20 +151,26 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, n_ctx, cfg, scale=False):
+    def __init__(self, n_ctx, cfg, scale=False, ret_wts=False):
         super(Block, self).__init__()
         nx = cfg.n_embd
-        self.attn = Attention(nx, n_ctx, cfg, scale)
+        self.attn = Attention(nx, n_ctx, cfg, scale, ret_wts=ret_wts)
         self.ln_1 = LayerNorm(nx)
         self.mlp = MLP(4 * nx, cfg)
         self.ln_2 = LayerNorm(nx)
 
     def forward(self, x, mask=None):
-        a = self.attn(x, mask)
+        if self.attn.ret_wts:
+            a, wts = self.attn(x, mask)
+        else:
+            a = self.attn(x, mask)
         n = self.ln_1(x + a)
         m = self.mlp(n)
         h = self.ln_2(n + m)
-        return h
+        if self.attn.ret_wts:
+            return h, wts
+        else:
+            return h
 
 
 class TransformerModel(nn.Module):
